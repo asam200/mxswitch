@@ -144,6 +144,33 @@ python python/mxswitch.py --info
 On Windows the Python version drives `hid.dll` and `setupapi.dll` through
 `ctypes` and needs no packages at all. Elsewhere it falls back to `hidapi`.
 
+The Python implementation also reads the Easy-Switch slot table:
+
+```powershell
+python .\python\mxswitch.py --info
+```
+
+It resolves `0x1814 ChangeHost` and `0x1815 HostsInfo` through HID++ ROOT at
+runtime, reads ChangeHost `getHostInfo` and `getCookies`, and prints Slot 1/2/3.
+Pairing is shown as `unknown` unless HostsInfo returns a defined status. Cookies
+are opaque application metadata and are never treated as pairing keys or proof
+that a slot is paired.
+
+### Reset development status
+
+The intended command is:
+
+```powershell
+python .\python\mxswitch.py reset --all --experimental
+```
+
+It is currently a read-only safety gate and exits with code 3. It checks whether
+the device advertises the `0x1815` `DELETE_HOST` capability, but sends no delete,
+cookie, NVM, pairing, DFU, or firmware command. A reset will remain disabled
+until a public protocol source or reproducible capture establishes the exact
+function number, parameters, response, and behavior of the bonding-record
+deletion command. See [docs/reset-research.md](docs/reset-research.md).
+
 ## Binding a shortcut
 
 **Windows** — `windows/mxswitch.ahk` (AutoHotkey v2). Edit the three paths at the

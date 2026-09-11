@@ -14,7 +14,7 @@ equivalent always-present C API to lean on.
     python mxswitch.py 2             # switch to channel 2
     python mxswitch.py --list        # dump candidate HID interfaces
 
-Exit codes: 0 ok, 1 device not found, 2 bad usage.
+Exit codes: 0 ok, 1 device not found, 2 bad usage, 3 reset unavailable.
 """
 
 import argparse
@@ -25,6 +25,9 @@ LOGITECH_VID = 0x046D
 SW_ID = 0x0A                  # software id, any value 1..15
 ROOT_FEATURE = 0x00
 FEAT_CHANGE_HOST = 0x1814
+FEAT_HOSTS_INFO = 0x1815
+FEAT_DEVICE_INFO = 0x0003
+FEAT_DEVICE_NAME = 0x0005
 
 SHORT, LONG = 0x10, 0x11      # HID++ report ids
 FRAME_LEN = {SHORT: 7, LONG: 20}
@@ -106,6 +109,16 @@ if sys.platform == "win32":
     setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
     setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), wintypes.LPCWSTR,
                                               wintypes.HWND, wintypes.DWORD]
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID), wintypes.DWORD,
+        ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+    ]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+        ctypes.POINTER(SP_DEVICE_INTERFACE_DETAIL_DATA_W), wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+    ]
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
@@ -298,6 +311,15 @@ def request(dev, report_id, dev_idx, feature_idx, function, params=b"", timeout_
     return None
 
 
+def get_feature(dev, dev_idx, report_id, feature_id):
+    """Resolve a HID++ feature ID through ROOT at runtime."""
+    params = bytes([feature_id >> 8, feature_id & 0xFF, 0])
+    reply = request(dev, report_id, dev_idx, ROOT_FEATURE, 0, params)
+    if not reply or len(reply) < 7 or reply[4] == 0:
+        return None
+    return {"index": reply[4], "type": reply[5], "version": reply[6]}
+
+
 def find_device():
     """Return (dev, dev_idx, report_id, changehost_feature_idx, info) or None."""
     probe = bytes([FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0x00])
@@ -323,9 +345,158 @@ def find_device():
     return None
 
 
-def host_info(dev, dev_idx, report_id, feat_idx):
+def get_host_info(dev, dev_idx, report_id, feat_idx):
+    """Read ChangeHost fn 0: host count, current host, and capability flags."""
     reply = request(dev, report_id, dev_idx, feat_idx, 0)
-    return (reply[4], reply[5]) if reply else None
+    if not reply or len(reply) < 7:
+        return None
+    host_count, current_host, capabilities = reply[4:7]
+    if host_count == 0 or current_host >= host_count:
+        return None
+    return {
+        "host_count": host_count,
+        "current_host": current_host,
+        "capabilities": capabilities,
+    }
+
+
+def get_cookies(dev, dev_idx, report_id, feat_idx, host_count):
+    """Read ChangeHost fn 2: one opaque persistent cookie byte per host."""
+    reply = request(dev, report_id, dev_idx, feat_idx, 2)
+    if not reply or len(reply) < 4 + host_count:
+        return None
+    return list(reply[4:4 + host_count])
+
+
+def get_device_identity(dev, dev_idx, report_id, feat_idx):
+    """Read Device Information fn 0 and decode its advertised transport IDs."""
+    reply = request(dev, report_id, dev_idx, feat_idx, 0)
+    if not reply or len(reply) < 17:
+        return None
+    transport_bits = reply[10]
+    model_id = reply[11:17]
+    offset = 0
+    transport_ids = {}
+    for name, flag in (("btid", 0x01), ("btleid", 0x02),
+                       ("wpid", 0x04), ("usbid", 0x08)):
+        if transport_bits & flag:
+            if offset + 2 > len(model_id):
+                return None
+            transport_ids[name] = model_id[offset:offset + 2].hex().upper()
+            offset += 2
+    return {
+        "entity_count": reply[4],
+        "unit_id": reply[5:9].hex().upper(),
+        "transport_ids": transport_ids,
+    }
+
+
+def get_device_name(dev, dev_idx, report_id, feat_idx):
+    """Read Device Name fn 0/1 without assuming the model from the USB receiver."""
+    reply = request(dev, report_id, dev_idx, feat_idx, 0)
+    if not reply or len(reply) < 5:
+        return None
+    length = reply[4]
+    name = bytearray()
+    while len(name) < length:
+        reply = request(dev, report_id, dev_idx, feat_idx, 1, bytes([len(name)]))
+        if not reply or len(reply) <= 4:
+            return None
+        fragment = reply[4:4 + min(16, length - len(name))]
+        if not fragment:
+            return None
+        name.extend(fragment)
+    try:
+        return bytes(name).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def get_hosts_info(dev, dev_idx, report_id, feat_idx):
+    """Read HostsInfo fn 0 capability flags and host count."""
+    reply = request(dev, report_id, dev_idx, feat_idx, 0)
+    if not reply or len(reply) < 8 or reply[6] == 0:
+        return None
+    return {
+        "capabilities": reply[4],
+        "descriptor_capabilities": reply[5],
+        "host_count": reply[6],
+        "current_host": reply[7],
+    }
+
+
+def get_host_slot_info(dev, dev_idx, report_id, feat_idx, host):
+    """Read HostsInfo fn 1 for an explicit zero-based slot."""
+    reply = request(dev, report_id, dev_idx, feat_idx, 1, bytes([host]))
+    if not reply or len(reply) < 10 or reply[4] != host:
+        return None
+    return {
+        "host": reply[4],
+        "status": reply[5],
+        "bus_type": reply[6],
+        "descriptor_pages": reply[7],
+        "name_length": reply[8],
+        "name_max_length": reply[9],
+    }
+
+
+def assess_reset_all(dev, dev_idx, report_id):
+    """Read advertised reset capability without issuing a mutation command."""
+    hosts_feature = get_feature(dev, dev_idx, report_id, FEAT_HOSTS_INFO)
+    if not hosts_feature:
+        return {
+            "available": False,
+            "delete_advertised": False,
+            "reason": "HostsInfo (0x1815) is not available on this device.",
+        }
+    hosts = get_hosts_info(dev, dev_idx, report_id, hosts_feature["index"])
+    if not hosts:
+        return {
+            "available": False,
+            "delete_advertised": False,
+            "reason": "HostsInfo capability data could not be read safely.",
+        }
+    advertised = bool(hosts["capabilities"] & 0x08)
+    if not advertised:
+        reason = (
+            "This device does not advertise HostsInfo DELETE_HOST capability "
+            f"(capabilities=0x{hosts['capabilities']:02X})."
+        )
+    else:
+        reason = (
+            "DELETE_HOST is advertised, but no verified public wire command "
+            "for deleting a bonding record has been found."
+        )
+    return {
+        "available": False,
+        "delete_advertised": advertised,
+        "reason": reason,
+    }
+
+
+def format_slot_lines(info, cookies, slots=None):
+    """Format slots without treating an opaque cookie as pairing evidence."""
+    bus_names = {0: "Undefined", 1: "eQuad", 2: "USB", 3: "BT",
+                 4: "BLE", 5: "BLE Pro"}
+    lines = []
+    for host in range(info["host_count"]):
+        current = "yes" if host == info["current_host"] else "no "
+        cookie = f"0x{cookies[host]:02X}" if cookies is not None else "unknown"
+        slot = slots[host] if slots and host < len(slots) else None
+        if slot and slot["status"] in (0, 1):
+            paired = "yes" if slot["status"] else "no"
+        elif slot:
+            paired = f"unknown(raw=0x{slot['status']:02X})"
+        else:
+            paired = "unknown"
+        bus_name = (bus_names.get(slot["bus_type"],
+                                  f"raw=0x{slot['bus_type']:02X}")
+                    if slot else None)
+        bus = f" bus={bus_name}" if bus_name else ""
+        lines.append(
+            f"Slot {host + 1}: current={current}  cookie={cookie}  paired={paired}{bus}"
+        )
+    return lines
 
 
 def set_host(dev, dev_idx, report_id, feat_idx, host_0based):
@@ -337,9 +508,12 @@ def set_host(dev, dev_idx, report_id, feat_idx, host_0based):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("channel", nargs="?", type=int, help="target channel, 1-based")
+    ap.add_argument("target", nargs="?", help="target channel (1-3), or reset")
     ap.add_argument("--info", action="store_true", help="show host info and exit")
     ap.add_argument("--list", action="store_true", help="dump HID interfaces and exit")
+    ap.add_argument("--all", action="store_true", help="with reset, target all slots")
+    ap.add_argument("--experimental", action="store_true",
+                    help="required for any operation intended to modify records")
     args = ap.parse_args()
 
     if args.list:
@@ -348,10 +522,24 @@ def main():
                   f"  out={i['out_len']}  {i['product_string']}")
         return 0
 
-    if not args.info and args.channel is None:
+    resetting = args.target == "reset"
+    if not args.info and args.target is None:
         ap.error("give a channel number, or --info")
-    if args.channel is not None and not 1 <= args.channel <= 3:
-        ap.error("channel must be 1, 2 or 3")
+    if resetting:
+        if not args.all:
+            ap.error("reset currently requires --all")
+        if not args.experimental:
+            ap.error("reset requires --experimental")
+        channel = None
+    elif args.target is not None:
+        try:
+            channel = int(args.target)
+        except ValueError:
+            ap.error("target must be channel 1, 2 or 3, or reset")
+        if not 1 <= channel <= 3:
+            ap.error("channel must be 1, 2 or 3")
+    else:
+        channel = None
 
     found = find_device()
     if not found:
@@ -361,18 +549,63 @@ def main():
         return 1
     dev, dev_idx, report_id, feat_idx, info = found
 
+    if resetting:
+        assessment = assess_reset_all(dev, dev_idx, report_id)
+        print("Reset was not performed.", file=sys.stderr)
+        print(assessment["reason"], file=sys.stderr)
+        print("No pairing, bonding, cookie, NVM, or DFU write was sent.",
+              file=sys.stderr)
+        return 3
+
     if args.info:
-        print(f"device     : {info['product_string']}")
+        device_info_feature = get_feature(dev, dev_idx, report_id, FEAT_DEVICE_INFO)
+        name_feature = get_feature(dev, dev_idx, report_id, FEAT_DEVICE_NAME)
+        identity = (get_device_identity(dev, dev_idx, report_id,
+                                        device_info_feature["index"])
+                    if device_info_feature else None)
+        device_name = (get_device_name(dev, dev_idx, report_id, name_feature["index"])
+                       if name_feature else None)
+        print(f"device     : {device_name or info['product_string']}")
         print(f"transport  : {'direct (BT/USB)' if dev_idx == 0xFF else 'receiver'}"
               f"  index={dev_idx:#04x}  report={report_id:#04x}")
+        if identity:
+            ids = " ".join(f"{key.upper()}={value}"
+                           for key, value in identity["transport_ids"].items())
+            print(f"identity   : unit={identity['unit_id']} {ids}")
+            values = set(identity["transport_ids"].values())
+            print(f"MX Master 4 B042: {'yes' if 'B042' in values else 'no'}")
         print(f"ChangeHost : feature index {feat_idx:#04x}")
-        hosts = host_info(dev, dev_idx, report_id, feat_idx)
-        if hosts:
-            print(f"channels   : {hosts[0]}, currently on {hosts[1] + 1}")
+        host = get_host_info(dev, dev_idx, report_id, feat_idx)
+        if host:
+            print(f"channels   : {host['host_count']}, currently on {host['current_host'] + 1}")
+            print(f"capability : enhanced-host-switch="
+                  f"{'yes' if host['capabilities'] & 0x01 else 'no'} "
+                  f"raw=0x{host['capabilities']:02X}")
+            cookies = get_cookies(dev, dev_idx, report_id, feat_idx,
+                                  host["host_count"])
+            slots = None
+            hosts_feature = get_feature(dev, dev_idx, report_id, FEAT_HOSTS_INFO)
+            if hosts_feature:
+                hosts = get_hosts_info(dev, dev_idx, report_id,
+                                       hosts_feature["index"])
+                if hosts:
+                    print(f"HostsInfo  : feature index 0x{hosts_feature['index']:02x} "
+                          f"version={hosts_feature['version']} capabilities=0x{hosts['capabilities']:02X}")
+                    print(f"delete-host advertised="
+                          f"{'yes' if hosts['capabilities'] & 0x08 else 'no'}")
+                    if hosts["host_count"] == host["host_count"]:
+                        slots = [get_host_slot_info(dev, dev_idx, report_id,
+                                                    hosts_feature["index"], slot)
+                                 for slot in range(host["host_count"])]
+            for line in format_slot_lines(host, cookies, slots):
+                print(line)
+            if slots is None or any(slot is None for slot in slots):
+                print("Pairing state is unknown where HostsInfo returned no valid status.")
+            print("ChangeHost cookies are metadata, not bonding records.")
         return 0
 
-    print(f"Switching to channel {args.channel} ...")
-    set_host(dev, dev_idx, report_id, feat_idx, args.channel - 1)
+    print(f"Switching to channel {channel} ...")
+    set_host(dev, dev_idx, report_id, feat_idx, channel - 1)
     return 0
 
 
